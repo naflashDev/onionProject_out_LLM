@@ -69,15 +69,22 @@ def process_json(input_path, output_path):
         data = json.load(f)
 
     # The input data is expected to be either a dict or a list of dicts
-    # Handle both cases
     records = data if isinstance(data, list) else [data]
 
     results = []
+    processed_texts = set()  # <-- para evitar textos duplicados
+
     for record in records:
         texts = extract_texts(record)
         for text in texts:
             if not text.strip():
                 continue
+
+            # si este texto ya se procesó antes, lo saltamos
+            if text in processed_texts:
+                continue
+            processed_texts.add(text)
+
             tags, detected_language = tag_text(text)
             results.append({
                 "text": text,
@@ -85,6 +92,7 @@ def process_json(input_path, output_path):
                 "tags": tags,
                 "relevance": len(tags)
             })
+
     #Obtain the parameters for the OpenSearch database
     parameters: tuple = (
         'localhost',
@@ -114,10 +122,13 @@ def process_json(input_path, output_path):
             return
     else:
         parameters = retorno_otros[2]  # Get parameters read from the config file
+
     # Sort results by number of named entities (relevance) descending
     results.sort(key=lambda x: x["relevance"], reverse=True)
+
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
+
     for doc in results:
         store_in_opensearch(doc, parameters[0], parameters[1], "spacy_documents")
 
