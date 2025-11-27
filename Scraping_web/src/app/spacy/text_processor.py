@@ -8,7 +8,7 @@ import os
 from langdetect import detect
 from loguru import logger
 from app.utils.utils import get_connection_parameters,create_config_file
-from app.models.opensearh_db import store_in_opensearch
+from app.models.opensearh_db import store_in_opensearch,text_exists_in_opensearch,ensure_index_exists
 
 # Load spaCy models by language (Spanish, English, and French)
 models = {
@@ -68,32 +68,12 @@ def process_json(input_path, output_path):
     with open(input_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # The input data is expected to be either a dict or a list of dicts
+    # The input data can be either a dict or a list of dicts; normalize to a list
     records = data if isinstance(data, list) else [data]
 
-    results = []
-    processed_texts = set()  # <-- para evitar textos duplicados
+    results: list[dict] = []
 
-    for record in records:
-        texts = extract_texts(record)
-        for text in texts:
-            if not text.strip():
-                continue
-
-            # si este texto ya se procesó antes, lo saltamos
-            if text in processed_texts:
-                continue
-            processed_texts.add(text)
-
-            tags, detected_language = tag_text(text)
-            results.append({
-                "text": text,
-                "language": detected_language,
-                "tags": tags,
-                "relevance": len(tags)
-            })
-
-    #Obtain the parameters for the OpenSearch database
+    # Default OpenSearch connection parameters (will be overridden if cfg.ini exists)
     parameters: tuple = (
         'localhost',
         9200
@@ -101,13 +81,13 @@ def process_json(input_path, output_path):
     file_name: str = 'cfg.ini'
     file_content: list[str] = [
         '# Configuration file.\n',
-        '# This file contains the parameters for connecting to the opensearch database server.\n',
+        '# This file contains the parameters for connecting to the OpenSearch database server.\n',
         '# ONLY one uncommented line is allowed.\n',
-        '# The valid line format is: server_ip,server_port\n',
+        '# The valid line format is: server_ip;server_port\n',
         f'{parameters[0]};{parameters[1]}\n'
     ]
 
-    # Get the connection parameters or assign default ones
+    # Get connection parameters or recreate configuration file if needed
     retorno_otros = get_connection_parameters(file_name)
     logger.info(retorno_otros[1])
 
@@ -115,20 +95,53 @@ def process_json(input_path, output_path):
         logger.info('Recreating configuration file...')
         retorno_otros = create_config_file(file_name, file_content)
         logger.info(retorno_otros[1])
-        # If the file had to be recreated, default values will be used
 
         if retorno_otros[0] != 0:
             logger.error('Configuration file missing. Execution cannot continue without a configuration file.')
             return
     else:
-        parameters = retorno_otros[2]  # Get parameters read from the config file
+        parameters = retorno_otros[2]  # Parameters read from the config file
 
-    # Sort results by number of named entities (relevance) descending
+
+    # Local set to avoid duplicate texts within the same execution
+    processed_texts: set[str] = set()
+
+    #Ensure the index exists in OpenSearch
+    ensure_index_exists(parameters[0], parameters[1], "spacy_documents")
+
+    for record in records:
+        texts = extract_texts(record)
+        for text in texts:
+            if not text.strip():
+                continue
+
+            # Skip duplicates inside the same run
+            if text in processed_texts:
+                continue
+
+            if text_exists_in_opensearch(text, parameters[0], parameters[1], "spacy_documents"):
+                logger.info(f"Text already indexed, skipping: {text[:80]}...")
+                continue
+
+            processed_texts.add(text)
+
+            tags, detected_language = tag_text(text)
+            doc = {
+                "text": text,
+                "language": detected_language,
+                "tags": tags,
+                "relevance": len(tags)
+            }
+            results.append(doc)
+
+    # Sort results by number of named entities (relevance) in descending order
     results.sort(key=lambda x: x["relevance"], reverse=True)
 
+    # Save results to the output JSON file
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
 
+    # Store each new document in OpenSearch
     for doc in results:
         store_in_opensearch(doc, parameters[0], parameters[1], "spacy_documents")
 
